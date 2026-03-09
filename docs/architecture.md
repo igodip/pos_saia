@@ -159,7 +159,7 @@ Only needed if you use local hardware.
 
 ## Suggested production stack
 
-* Backend: FastAPI or Node.js (NestJS/Express)
+* Backend: Laravel
 * Store Agent: Rust or Node.js
 * Database: PostgreSQL
 * Queue: Redis-backed queue or Postgres outbox + worker
