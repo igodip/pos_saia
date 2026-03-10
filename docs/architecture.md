@@ -29,6 +29,35 @@ This blueprint does not attempt to make you a fiscal compliance provider from ze
 
 # 1. High-level architecture
 
+## Runtime interaction flow (happy path)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Cashier as Cashier
+  participant POS as POS Client
+  participant API as POS Backend API
+  participant PAY as Payment Service
+  participant FISC as Fiscal Service
+  participant ADP as Fiscal Adapter
+  participant DB as PostgreSQL
+
+  Cashier->>POS: Finalize cart
+  POS->>API: POST /sales/{id}/finalize
+  API->>DB: lock sale + compute totals
+  API-->>POS: PAYMENT_PENDING
+  POS->>API: POST /sales/{id}/payments
+  API->>PAY: authorize/capture
+  PAY-->>API: authorization success
+  API->>DB: persist payment
+  API->>FISC: enqueue fiscal job
+  FISC->>ADP: issue_receipt(canonical payload)
+  ADP-->>FISC: provider receipt response
+  FISC->>DB: persist fiscal_document
+  FISC-->>API: FISCAL_ACCEPTED
+  API-->>POS: receipt ready
+```
+
 ## Core components
 
 ### POS Client
@@ -136,9 +165,56 @@ Responsibilities:
 * fiscal adapter configuration
 * monitoring failed fiscal jobs
 
+## Bounded contexts and ownership
+
+Keep ownership explicit to avoid accidental coupling:
+
+* **Sales Context**: cart lifecycle, sale lines, discounts, totals
+* **Payments Context**: authorization, capture, reversal, acquirer references
+* **Fiscal Context**: document transformation, adapter calls, retries, closures
+* **Reporting Context**: read models/materialized views, reconciliation exports
+* **Identity/Admin Context**: operators, roles, store and terminal provisioning
+
+Each context can share the same Postgres instance in MVP, but should expose clear service boundaries in code.
+
 ---
 
 # 2. Recommended deployment shape
+
+## Logical component diagram
+
+```mermaid
+flowchart LR
+  subgraph Store[Store LAN]
+    POS[POS Client]
+    AGENT[Store Agent\n(optional)]
+    RT[RT/Fiscal Printer\n(optional)]
+    PAYTERM[Card Terminal]
+    POS --> PAYTERM
+    POS --> AGENT
+    AGENT --> RT
+  end
+
+  subgraph Cloud[Central Backend]
+    API[POS Backend API]
+    FISC[Fiscal Service]
+    PAY[Payment Service]
+    WORKER[Fiscal Worker]
+    DB[(PostgreSQL)]
+    REDIS[(Redis/Queue)]
+    OBJ[(Object Storage)]
+  end
+
+  POS --> API
+  API --> PAY
+  API --> FISC
+  FISC --> WORKER
+  API --> DB
+  FISC --> DB
+  WORKER --> DB
+  WORKER --> REDIS
+  FISC --> OBJ
+```
 
 ## Central services
 
@@ -962,6 +1038,20 @@ Queue locally if policy allows, otherwise block checkout and raise an operator-v
 
 Ignore if a fiscal document already exists with the same idempotency key and final success state.
 
+## Recommended idempotency key strategy
+
+Use a deterministic key format that is stable across retries and unique across meaningful mutations:
+
+```text
+fiscal:{store_id}:{terminal_id}:{sale_id}:{fiscal_revision}:{adapter_name}
+```
+
+Where:
+
+* `fiscal_revision` starts at `1` for first issuance
+* increment revision only when a legal corrective operation requires a new fiscal document attempt
+* keep revision immutable once a document reaches final success
+
 ---
 
 # 11. Security and audit
@@ -1044,6 +1134,16 @@ group by s.business_date, s.store_id, sl.vat_code;
 * duplicate fiscalize request
 * timeout from adapter with later reconciliation
 * closure operation
+
+## End-to-end operational checks
+
+Before production rollout for each store:
+
+* printer/API adapter health check from Store Agent and backend
+* payment terminal connectivity and reversal dry-run
+* closure dry-run in sandbox mode
+* forced timeout scenario to validate manual recovery runbook
+* duplicate submission scenario to verify idempotent behavior
 
 ## Sandbox adapter
 
@@ -1149,3 +1249,30 @@ Useful follow-ups after this blueprint:
 5. React or Flutter POS client skeleton
 6. Admin dashboard for failed fiscal jobs and closures
 
+---
+
+# 18. Observability baseline (recommended)
+
+Track these from day one:
+
+* `sales_finalize_latency_ms` (p50/p95/p99)
+* `payment_authorization_latency_ms`
+* `fiscal_issue_latency_ms`
+* `fiscal_issue_success_rate`
+* `fiscal_retry_count`
+* `fiscal_manual_intervention_count`
+* `closure_success_rate`
+
+Minimum structured logging fields:
+
+* `trace_id`, `sale_id`, `store_id`, `terminal_id`
+* `fiscal_job_id`, `adapter_name`, `idempotency_key`
+* `payment_id`, `provider`, `external_tx_id`
+* error class/code and retry decision
+
+Alerting suggestions:
+
+* fiscal success rate below threshold over 5–15 min
+* backlog growth in fiscal job queue
+* closure failures near end-of-day cutoff
+* sustained payment/fiscal mismatch count > 0
